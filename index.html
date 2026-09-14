@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1" />
+<title>Keuangan Keluarga</title>
+<meta name="description" content="Catat uang masuk, uang keluar, tagihan, budget, dan tabungan keluarga." />
+
+<!-- PWA -->
+<link rel="manifest" href="./manifest.json" />
+<meta name="theme-color" content="#F7C948" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="apple-mobile-web-app-title" content="Keuangan Keluarga" />
+<link rel="apple-touch-icon" href="./icons/icon-192.png" />
+<link rel="icon" href="./icons/icon-192.png" />
+
+<style>
+  html, body { margin: 0; padding: 0; background: #F6F7FB; overscroll-behavior-y: none; }
+  #root { min-height: 100vh; }
+  #boot-fallback {
+    position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+    flex-direction: column; gap: 12px; background: #F6F7FB; font-family: -apple-system, sans-serif;
+  }
+  #boot-fallback .box { width: 56px; height: 56px; border-radius: 24px; background: #F7C948; display:flex; align-items:center; justify-content:center; color:white; font-size: 26px; font-weight: 800; }
+  #boot-fallback p { color: #8A8FA3; font-size: 13px; font-weight: 600; }
+</style>
+
+<!-- Import map: lets the browser resolve bare module specifiers (react, lucide-react, recharts)
+     straight from a CDN — no npm install, no bundler. -->
+<script type="importmap">
+{
+  "imports": {
+    "react": "https://esm.sh/react@18.3.1",
+    "react-dom": "https://esm.sh/react-dom@18.3.1",
+    "react-dom/client": "https://esm.sh/react-dom@18.3.1/client",
+    "lucide-react": "https://esm.sh/lucide-react@0.383.0?external=react",
+    "recharts": "https://esm.sh/recharts@2.12.7?external=react,react-dom"
+  }
+}
+</script>
+
+<!-- Tailwind CSS (Play CDN build) — required because app.jsx styles everything with
+     Tailwind utility classes (including arbitrary values like text-[13px]). Without this,
+     the whole layout renders unstyled. It watches the live DOM, so it works fine with
+     React re-rendering dynamically. -->
+<script src="https://cdn.tailwindcss.com"></script>
+
+<!-- Babel Standalone: transpiles the JSX in app.jsx to plain JS, right in the browser,
+     so there is no build step. This is the only "framework" file loaded besides React itself. -->
+<script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js"></script>
+</head>
+<body>
+  <div id="root">
+    <div id="boot-fallback">
+      <div class="box">Rp</div>
+      <p>Memuat Keuangan Keluarga...</p>
+    </div>
+  </div>
+
+  <script type="text/babel" data-type="module" data-presets="react" src="./app.jsx"></script>
+</body>
+</html>
