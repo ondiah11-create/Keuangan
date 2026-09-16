@@ -6,7 +6,7 @@ import {
   Trash2, Pencil, Check, AlertTriangle, Calendar, Users, Tag, CreditCard, Landmark,
   Smartphone, Banknote, TrendingUp, TrendingDown, Sparkles, Bell, Settings, Info,
   RefreshCw, User, UserPlus, ArrowLeft, CheckCircle2, Clock, Coins, MoreHorizontal,
-  Wallet, BarChart3, FileText, ReceiptText
+  Wallet, BarChart3, FileText, ReceiptText, Inbox
 } from "lucide-react";
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
@@ -192,7 +192,9 @@ function accountBalance(acc, d) {
     if (t.tipe === "EXPENSE" && t.to_account_id === acc.id) bal += nom;
   }
   for (const g of d.goalDeposits) if (g.account_id === acc.id) bal -= Number(g.nominal) || 0;
-  for (const b of d.billPayments) if (b.account_id === acc.id) bal -= Number(b.nominal) || 0;
+  // Only legacy bill payments (created before payments became real transactions) are
+  // subtracted here — new ones already reduce the balance via their linked transaction.
+  for (const b of d.billPayments) if (!b.linked_tx_id && b.account_id === acc.id) bal -= Number(b.nominal) || 0;
   return bal;
 }
 
@@ -207,6 +209,12 @@ function liquidBalance(d) {
     .reduce((s, a) => s + accountBalance(a, d), 0);
 }
 
+// Income: every INCOME transaction from every account (transfers never count as income).
+// Expense: every EXPENSE transaction — which now includes bill payments and goal deposits,
+// since those are created as real categorized EXPENSE transactions — plus, for backward
+// compatibility, any pre-existing bill payment / goal deposit that predates that change and
+// therefore only lives in the old billPayments/goalDeposits ledgers. This is the one shared
+// source of truth used by the dashboard, charts, category summaries, insights, and reports.
 function monthTotals(d, ym) {
   let income = 0, expense = 0;
   d.transactions.forEach((t) => {
@@ -214,6 +222,12 @@ function monthTotals(d, ym) {
     const nom = Number(t.nominal) || 0;
     if (t.tipe === "INCOME") income += nom;
     if (t.tipe === "EXPENSE") expense += nom;
+  });
+  (d.billPayments || []).forEach((p) => {
+    if (!p.linked_tx_id && monthKey(p.tanggal) === ym) expense += Number(p.nominal) || 0;
+  });
+  (d.goalDeposits || []).forEach((g) => {
+    if (monthKey(g.tanggal) === ym) expense += Number(g.nominal) || 0;
   });
   return { income, expense };
 }
@@ -247,6 +261,67 @@ function ensureSavingCategoryId(data, mutate) {
   const id = uid("cat");
   mutate.addItem("categories", { id, tipe: "EXPENSE", nama: GOAL_SAVING_CATEGORY_NAME, icon: "\u{1F3E6}", warna: C.mint, parent_id: null, is_default: true, is_active: true });
   return id;
+}
+
+// Builds the actual EXPENSE transaction for a goal deposit: reduces the source account,
+// credits the goal's destination account (if any), and tags it to the goal + savings category.
+// Centralized here (instead of duplicated per call site) so every deposit path is guaranteed
+// to include every required field (this exact bug — a missing `nominal` — happened before).
+function buildGoalDepositTx(goal, payload, data, mutate, catatanFallback) {
+  const catId = ensureSavingCategoryId(data, mutate);
+  const nominal = Number(payload.nominal) || 0;
+  return {
+    id: uid("tx"),
+    tipe: "EXPENSE",
+    nominal,
+    account_id: payload.account_id,
+    to_account_id: goal.account_id || null,
+    category_id: catId,
+    member_id: null,
+    tanggal: payload.tanggal,
+    catatan: payload.catatan || catatanFallback || null,
+    merchant: null,
+    goal_id: goal.id,
+  };
+}
+
+// Finds a real category to attach to a bill's payments: prefers the bill's own category_id,
+// falls back to matching its legacy free-text `kategori` name, else a generic "Lainnya".
+// This is what makes bill payments show up correctly in category-based charts/reports.
+function resolveBillCategoryId(bill, data, mutate) {
+  if (bill.category_id) {
+    const exists = data.categories.find((c) => c.id === bill.category_id && c.tipe === "EXPENSE");
+    if (exists) return exists.id;
+  }
+  if (bill.kategori) {
+    const match = data.categories.find((c) => c.tipe === "EXPENSE" && c.nama.toLowerCase() === String(bill.kategori).toLowerCase());
+    if (match) return match.id;
+  }
+  const lainnya = data.categories.find((c) => c.tipe === "EXPENSE" && c.nama === "Lainnya");
+  if (lainnya) return lainnya.id;
+  const id = uid("cat");
+  mutate.addItem("categories", { id, tipe: "EXPENSE", nama: "Lainnya", icon: "\u{1F516}", warna: C.muted, parent_id: null, is_default: true, is_active: true });
+  return id;
+}
+
+// Builds the actual EXPENSE transaction for a bill payment, so it shows up everywhere a
+// normal expense would: transactions list, category summaries, charts, insights, reports.
+function buildBillPaymentTx(bill, payload, data, mutate) {
+  const catId = resolveBillCategoryId(bill, data, mutate);
+  const nominal = Number(payload.nominal) || 0;
+  return {
+    id: uid("tx"),
+    tipe: "EXPENSE",
+    nominal,
+    account_id: payload.account_id,
+    to_account_id: null,
+    category_id: catId,
+    member_id: null,
+    tanggal: payload.tanggal,
+    catatan: payload.catatan || bill.nama,
+    merchant: null,
+    bill_id: bill.id,
+  };
 }
 
 function billNextDue(bill, ref) {
@@ -431,6 +506,7 @@ const ACCOUNT_ICONS = {
   E_WALLET: Smartphone,
   CREDIT_CARD: CreditCard,
   SAVING: PiggyBank,
+  PENAMPUNG: Inbox,
   OTHER: Wallet,
 };
 const ACCOUNT_LABELS = {
@@ -440,10 +516,11 @@ const ACCOUNT_LABELS = {
   E_WALLET: "E-Wallet",
   CREDIT_CARD: "Kartu Kredit",
   SAVING: "Tabungan",
+  PENAMPUNG: "Penampung",
   OTHER: "Lainnya",
 };
-// Account types counted in the "liquid cash" figure shown on the home dashboard.
-const LIQUID_ACCOUNT_TYPES = ["KAS", "CASH", "E_WALLET"];
+// Account types counted in the "Saldo kamu" (liquid balance) figure on the home dashboard.
+const LIQUID_ACCOUNT_TYPES = ["KAS", "CASH", "E_WALLET", "BANK"];
 
 function AccountIconChip({ tipe, color, size = 44 }) {
   const Ico = ACCOUNT_ICONS[tipe] || Wallet;
@@ -787,18 +864,30 @@ const TABS = [
   { key: "more", label: "Lainnya", icon: LayoutGrid },
 ];
 
-function BottomNav({ active, onChange }) {
+function BottomNav({ active, onChange, onFabClick }) {
   return (
     <div className="fixed inset-x-0 bottom-0 z-40 flex justify-center">
       <div className="flex w-full max-w-[480px] items-stretch justify-between rounded-t-[26px] bg-white px-2 pb-2 pt-2" style={{ boxShadow: "0 -6px 24px rgba(20,24,60,0.08)" }}>
         {TABS.map((t) => {
           const Ico = t.icon;
           const isActive = active === t.key;
+          const isLast = t.key === "more";
           return (
-            <button key={t.key} onClick={() => onChange(t.key)} className="flex flex-1 flex-col items-center gap-1 rounded-2xl py-1.5">
-              <Ico size={22} color={isActive ? C.blueDark : C.muted} strokeWidth={isActive ? 2.6 : 2} />
-              <span className="text-[10.5px] font-bold" style={{ color: isActive ? C.blueDark : C.muted }}>{t.label}</span>
-            </button>
+            <div key={t.key} className="relative flex flex-1 flex-col items-center">
+              {isLast && (
+                <button
+                  onClick={onFabClick}
+                  className="absolute flex items-center justify-center rounded-full shadow-lg active:scale-95"
+                  style={{ top: -50, left: "50%", transform: "translateX(-50%)", width: 50, height: 50, background: `linear-gradient(135deg, ${C.blue}, ${C.blueDark})`, color: C.ink, boxShadow: "0 8px 20px rgba(223,162,42,0.45)" }}
+                >
+                  <Plus size={24} strokeWidth={2.6} />
+                </button>
+              )}
+              <button onClick={() => onChange(t.key)} className="flex w-full flex-col items-center gap-1 rounded-2xl py-1.5">
+                <Ico size={22} color={isActive ? C.blueDark : C.muted} strokeWidth={isActive ? 2.6 : 2} />
+                <span className="text-[10.5px] font-bold" style={{ color: isActive ? C.blueDark : C.muted }}>{t.label}</span>
+              </button>
+            </div>
           );
         })}
       </div>
@@ -806,31 +895,16 @@ function BottomNav({ active, onChange }) {
   );
 }
 
-function Fab({ onPick }) {
-  const [open, setOpen] = useState(false);
+function FabSheet({ open, onClose, onPick }) {
+  if (!open) return null;
   return (
-    <>
-      <div className="pointer-events-none fixed inset-x-0 z-40 flex justify-center" style={{ bottom: 108 }}>
-        <div className="relative w-full max-w-[480px]">
-          <button
-            onClick={() => setOpen(true)}
-            className="pointer-events-auto absolute flex items-center justify-center rounded-full shadow-lg active:scale-95"
-            style={{ right: 20, width: 58, height: 58, background: `linear-gradient(135deg, ${C.blue}, ${C.blueDark})`, color: C.ink, boxShadow: "0 10px 24px rgba(223,162,42,0.45)" }}
-          >
-            <Plus size={26} strokeWidth={2.6} />
-          </button>
-        </div>
+    <Sheet title="Catat transaksi" onClose={onClose}>
+      <div className="flex flex-col gap-3 pb-2">
+        <QuickActionRow icon={ArrowDownLeft} color={C.orange} label="Pengeluaran" desc="Uang keluar dari rekening" onClick={() => { onClose(); onPick("EXPENSE"); }} />
+        <QuickActionRow icon={ArrowUpRight} color={C.green} label="Pemasukan" desc="Uang masuk ke rekening" onClick={() => { onClose(); onPick("INCOME"); }} />
+        <QuickActionRow icon={ArrowLeftRight} color={C.mint} label="Transfer" desc="Pindah saldo antar rekening" onClick={() => { onClose(); onPick("TRANSFER"); }} />
       </div>
-      {open && (
-        <Sheet title="Catat transaksi" onClose={() => setOpen(false)}>
-          <div className="flex flex-col gap-3 pb-2">
-            <QuickActionRow icon={ArrowDownLeft} color={C.orange} label="Pengeluaran" desc="Uang keluar dari rekening" onClick={() => { setOpen(false); onPick("EXPENSE"); }} />
-            <QuickActionRow icon={ArrowUpRight} color={C.green} label="Pemasukan" desc="Uang masuk ke rekening" onClick={() => { setOpen(false); onPick("INCOME"); }} />
-            <QuickActionRow icon={ArrowLeftRight} color={C.mint} label="Transfer" desc="Pindah saldo antar rekening" onClick={() => { setOpen(false); onPick("TRANSFER"); }} />
-          </div>
-        </Sheet>
-      )}
-    </>
+    </Sheet>
   );
 }
 
@@ -875,7 +949,6 @@ function Dashboard({ data, go, openTx }) {
   const ym = ymNow();
   const now = new Date();
   const { income, expense } = monthTotals(data, ym);
-  const sisa = income - expense;
   const balance = liquidBalance(data);
   const insights = useMemo(() => buildInsights(data), [data]);
 
@@ -944,7 +1017,7 @@ function Dashboard({ data, go, openTx }) {
           </button>
         </div>
         <div className="mt-6">
-          <div className="text-[13px]" style={{ color: "rgba(34,48,58,0.68)" }}>Saldo kamu <span style={{ opacity: 0.75 }}>(Kas, Tunai, E-Wallet)</span></div>
+          <div className="text-[13px]" style={{ color: "rgba(34,48,58,0.68)" }}>Saldo kamu <span style={{ opacity: 0.75 }}>(Kas, Tunai, E-Wallet, Bank)</span></div>
           <div className="text-[32px] font-extrabold" style={{ color: C.ink, fontFamily: "'Baloo 2', sans-serif" }}>{formatMoney(balance)}</div>
         </div>
       </div>
@@ -963,13 +1036,6 @@ function Dashboard({ data, go, openTx }) {
           </div>
           <div className="text-[11.5px] font-semibold" style={{ color: C.muted }}>Pengeluaran bulan ini</div>
           <div className="text-[16px] font-extrabold" style={{ color: C.ink, fontFamily: "'Baloo 2', sans-serif" }}>{formatMoney(expense)}</div>
-        </div>
-      </div>
-
-      <div className="mx-5 mt-3 rounded-3xl p-4" style={{ background: sisa >= 0 ? C.greenLight : C.redLight }}>
-        <div className="flex items-center justify-between">
-          <span className="text-[13px] font-semibold" style={{ color: C.ink }}>Sisa bulan ini</span>
-          <span className="text-[17px] font-extrabold" style={{ color: sisa >= 0 ? C.green : C.red, fontFamily: "'Baloo 2', sans-serif" }}>{formatMoney(sisa)}</span>
         </div>
       </div>
 
@@ -1318,12 +1384,14 @@ function TransactionForm({ data, initialTipe, editing, onSave, onClose, onDelete
       tipe,
       nominal: nom,
       account_id: accountId,
-      to_account_id: tipe === "TRANSFER" ? toAccountId : null,
+      to_account_id: tipe === "TRANSFER" ? toAccountId : editing?.goal_id ? editing.to_account_id || null : null,
       category_id: tipe === "TRANSFER" ? null : categoryId,
       member_id: memberId || null,
       tanggal,
       merchant: merchant || null,
       catatan: catatan || null,
+      goal_id: editing?.goal_id || null,
+      bill_id: editing?.bill_id || null,
     };
     onSave(payload, isEdit);
   }
@@ -1352,6 +1420,17 @@ function TransactionForm({ data, initialTipe, editing, onSave, onClose, onDelete
               {cfg.label}
             </button>
           ))}
+        </div>
+      )}
+
+      {isEdit && editing?.goal_id && (
+        <div className="mb-4 rounded-2xl p-3 text-[12px] font-medium" style={{ background: C.mintLight, color: C.ink }}>
+          Ini setoran untuk sebuah goal. Nominal & tanggal ikut memengaruhi progres goal itu; tautan ke rekening tujuannya tetap tersimpan.
+        </div>
+      )}
+      {isEdit && editing?.bill_id && (
+        <div className="mb-4 rounded-2xl p-3 text-[12px] font-medium" style={{ background: C.blueLight, color: C.ink }}>
+          Ini pembayaran sebuah tagihan. Mengubah nominal & tanggal di sini juga ikut mengubah riwayat pembayaran tagihan itu.
         </div>
       )}
 
@@ -1593,7 +1672,12 @@ function CategoriesPage({ data, back, mutate }) {
   const subOf = (id) => data.categories.filter((c) => c.parent_id === id);
 
   function usedElsewhere(id) {
-    return data.transactions.some((t) => t.category_id === id) || data.budgets.some((b) => b.category_id === id) || data.categories.some((c) => c.parent_id === id);
+    return (
+      data.transactions.some((t) => t.category_id === id) ||
+      data.budgets.some((b) => b.category_id === id) ||
+      data.categories.some((c) => c.parent_id === id) ||
+      data.bills.some((b) => b.category_id === id)
+    );
   }
 
   return (
@@ -1811,9 +1895,11 @@ function BudgetsPage({ data, mutate }) {
 /* ============================================================
    BILLS
    ============================================================ */
-function BillForm({ editing, onSave, onClose }) {
+function BillForm({ editing, data, onSave, onClose }) {
   const [nama, setNama] = useState(editing?.nama || "");
-  const [kategori, setKategori] = useState(editing?.kategori || "");
+  const expenseCats = data.categories.filter((c) => c.tipe === "EXPENSE" && c.is_active);
+  const initialCatId = editing?.category_id || expenseCats.find((c) => c.nama.toLowerCase() === String(editing?.kategori || "").toLowerCase())?.id || "";
+  const [categoryId, setCategoryId] = useState(initialCatId);
   const [nominal, setNominal] = useState(editing ? String(editing.nominal_default) : "");
   const [jatuhTempo, setJatuhTempo] = useState(editing ? String(editing.jatuh_tempo) : "1");
   const [frekuensi, setFrekuensi] = useState(editing?.frekuensi || "BULANAN");
@@ -1823,12 +1909,14 @@ function BillForm({ editing, onSave, onClose }) {
 
   function submit() {
     if (!nama.trim()) return setErr("Nama tagihan wajib diisi.");
+    if (!categoryId) return setErr("Pilih kategori.");
     const nom = Number(nominal);
     if (!nom || nom <= 0) return setErr("Nominal harus lebih dari 0.");
     const day = Number(jatuhTempo);
     if (!day || day < 1 || day > 31) return setErr("Tanggal jatuh tempo 1-31.");
+    const cat = data.categories.find((c) => c.id === categoryId);
     onSave({
-      id: editing?.id || uid("bill"), nama: nama.trim(), kategori: kategori.trim() || "Lainnya", nominal_default: nom,
+      id: editing?.id || uid("bill"), nama: nama.trim(), category_id: categoryId, kategori: cat?.nama || "Lainnya", nominal_default: nom,
       jatuh_tempo: day, frekuensi, reminder_days: Number(reminderDays) || 3, auto_repeat: autoRepeat, is_active: editing ? editing.is_active : true,
     });
   }
@@ -1836,7 +1924,12 @@ function BillForm({ editing, onSave, onClose }) {
   return (
     <Sheet title={editing ? "Edit tagihan" : "Tagihan baru"} onClose={onClose} footer={<PrimaryButton onClick={submit}>Simpan tagihan</PrimaryButton>}>
       <Field label="Nama tagihan" required><TextInput value={nama} onChange={(e) => setNama(e.target.value)} placeholder="Contoh: Listrik PLN" /></Field>
-      <Field label="Kategori"><TextInput value={kategori} onChange={(e) => setKategori(e.target.value)} placeholder="Contoh: Listrik" /></Field>
+      <Field label="Kategori" required>
+        <SelectInput value={categoryId} onChange={(e) => setCategoryId(e.target.value)}>
+          <option value="">Pilih kategori</option>
+          {expenseCats.map((c) => <option key={c.id} value={c.id}>{c.icon} {c.nama}</option>)}
+        </SelectInput>
+      </Field>
       <Field label="Nominal" required><MoneyInput value={nominal} onChange={setNominal} /></Field>
       <div className="grid grid-cols-2 gap-3">
         <Field label="Tanggal jatuh tempo" required><TextInput type="number" min="1" max="31" value={jatuhTempo} onChange={(e) => setJatuhTempo(e.target.value)} /></Field>
@@ -1871,7 +1964,7 @@ function BillPaymentForm({ bill, data, onSave, onClose }) {
     if (!accountId) return setErr("Pilih rekening sumber pembayaran.");
     const nom = Number(nominal);
     if (!nom || nom <= 0) return setErr("Nominal harus lebih dari 0.");
-    onSave({ id: uid("bp"), bill_id: bill.id, account_id: accountId, nominal: nom, tanggal, catatan: catatan || null });
+    onSave({ account_id: accountId, nominal: nom, tanggal, catatan: catatan || null });
   }
 
   return (
@@ -1910,7 +2003,7 @@ function BillsPage({ data, go, mutate }) {
           </div>
         )}
       </div>
-      {form && <BillForm editing={form.id ? form : null} onSave={(payload) => { form.id ? mutate.updateItem("bills", payload.id, payload) : mutate.addItem("bills", payload); setForm(null); }} onClose={() => setForm(null)} />}
+      {form && <BillForm editing={form.id ? form : null} data={data} onSave={(payload) => { form.id ? mutate.updateItem("bills", payload.id, payload) : mutate.addItem("bills", payload); setForm(null); }} onClose={() => setForm(null)} />}
     </div>
   );
 }
@@ -1922,9 +2015,20 @@ function BillDetailPage({ data, id, back, mutate }) {
   const [confirmDel, setConfirmDel] = useState(false);
   if (!bill) return <div className="p-5"><PageHeader title="Tagihan" onBack={back} /><EmptyState title="Tagihan tidak ditemukan" /></div>;
   const st = billStatus(bill, data);
-  const payments = data.billPayments.filter((p) => p.bill_id === bill.id).sort((a, b) => (a.tanggal < b.tanggal ? 1 : -1));
+  // Merge legacy bill-payment records (pre-transaction era) with the real linked transactions,
+  // reading amounts from the transaction when one exists so an edited transaction always wins.
+  const legacyPayments = data.billPayments.filter((p) => p.bill_id === bill.id && !p.linked_tx_id).map((p) => ({ id: p.id, tanggal: p.tanggal, nominal: p.nominal, account_id: p.account_id, catatan: p.catatan }));
+  const txPayments = data.transactions.filter((t) => t.bill_id === bill.id && t.tipe === "EXPENSE").map((t) => ({ id: t.id, tanggal: t.tanggal, nominal: t.nominal, account_id: t.account_id, catatan: t.catatan }));
+  const payments = [...legacyPayments, ...txPayments].sort((a, b) => (a.tanggal < b.tanggal ? 1 : -1));
   const hasPayments = payments.length > 0;
   const badgeColor = { LATE: C.red, TODAY: C.yellowDark, UPCOMING: C.blue, PAID: C.green }[st.status];
+
+  function payBill(payload) {
+    const tx = buildBillPaymentTx(bill, payload, data, mutate);
+    mutate.addItem("transactions", tx);
+    mutate.addItem("billPayments", { id: uid("bp"), bill_id: bill.id, account_id: payload.account_id, nominal: tx.nominal, tanggal: payload.tanggal, catatan: payload.catatan || null, linked_tx_id: tx.id });
+    setPayForm(false);
+  }
   const badgeBg = { LATE: C.redLight, TODAY: "#FFF7E0", UPCOMING: C.blueLight, PAID: C.greenLight }[st.status];
 
   return (
@@ -1959,8 +2063,8 @@ function BillDetailPage({ data, id, back, mutate }) {
           </div>
         )}
       </div>
-      {form && <BillForm editing={form} onSave={(payload) => { mutate.updateItem("bills", payload.id, payload); setForm(null); }} onClose={() => setForm(null)} />}
-      {payForm && <BillPaymentForm bill={bill} data={data} onSave={(payload) => { mutate.addItem("billPayments", payload); setPayForm(false); }} onClose={() => setPayForm(false)} />}
+      {form && <BillForm editing={form} data={data} onSave={(payload) => { mutate.updateItem("bills", payload.id, payload); setForm(null); }} onClose={() => setForm(null)} />}
+      {payForm && <BillPaymentForm bill={bill} data={data} onSave={payBill} onClose={() => setPayForm(false)} />}
       {confirmDel && (
         <ConfirmDialog
           title="Hapus tagihan?"
@@ -2282,24 +2386,14 @@ function GoalDetailPage({ data, id, back, mutate }) {
   const doneCount = (data.goalInstallments || []).filter((x) => x.goal_id === goal.id && x.status === "DONE").length;
   const totalPlanCount = planned.length + doneCount;
 
-  function makeDepositTransaction(payload, catatan) {
-    const catId = ensureSavingCategoryId(data, mutate);
-    mutate.addItem("transactions", {
-      id: uid("tx"), tipe: "EXPENSE", account_id: payload.account_id, to_account_id: goal.account_id || null,
-      category_id: catId, member_id: null, tanggal: payload.tanggal, catatan: payload.catatan || catatan || null,
-      merchant: null, goal_id: goal.id,
-    });
+  function makeDepositTransaction(payload) {
+    mutate.addItem("transactions", buildGoalDepositTx(goal, payload, data, mutate));
   }
 
   function realize(item, payload) {
-    const depositId = uid("tx");
-    const catId = ensureSavingCategoryId(data, mutate);
-    mutate.addItem("transactions", {
-      id: depositId, tipe: "EXPENSE", account_id: payload.account_id, to_account_id: goal.account_id || null,
-      category_id: catId, member_id: null, tanggal: payload.tanggal, catatan: `Cicilan ke-${item.urutan} dari ${item.total_kali}`,
-      merchant: null, goal_id: goal.id,
-    });
-    mutate.updateItem("goalInstallments", item.id, { status: "DONE", deposit_id: depositId, nominal: payload.nominal, tanggal: payload.tanggal });
+    const tx = buildGoalDepositTx(goal, payload, data, mutate, `Cicilan ke-${item.urutan} dari ${item.total_kali}`);
+    mutate.addItem("transactions", tx);
+    mutate.updateItem("goalInstallments", item.id, { status: "DONE", deposit_id: tx.id, nominal: tx.nominal, tanggal: tx.tanggal });
     setRealizeItem(null);
   }
 
@@ -2804,6 +2898,7 @@ export default function App() {
   const [data, setData, ready] = usePersistentData();
   const [stack, setStack] = useState([{ page: "dashboard" }]);
   const [txModal, setTxModal] = useState(null);
+  const [fabOpen, setFabOpen] = useState(false);
 
   const current = stack[stack.length - 1];
 
@@ -2868,6 +2963,14 @@ export default function App() {
   }
   function deleteTx(id) {
     mutate.removeItem("transactions", id);
+    // If this transaction was the realized deposit for a planned installment, put that
+    // installment back to PLANNED so it doesn't silently disappear as "done" forever.
+    const linkedInstallment = (data.goalInstallments || []).find((x) => x.deposit_id === id);
+    if (linkedInstallment) mutate.updateItem("goalInstallments", linkedInstallment.id, { status: "PLANNED", deposit_id: null });
+    // If this transaction was a bill payment, remove its payment record too so the bill
+    // correctly goes back to "belum dibayar" instead of staying stuck as paid.
+    const linkedBillPayment = (data.billPayments || []).find((p) => p.linked_tx_id === id);
+    if (linkedBillPayment) mutate.removeItem("billPayments", linkedBillPayment.id);
     setTxModal(null);
     if (current.page === "transactionDetail") back();
   }
@@ -2928,9 +3031,9 @@ export default function App() {
   return (
     <Shell>
       {body}
-      <div style={{ height: 130 }} />
-      <BottomNav active={activeTab} onChange={goTab} />
-      <Fab onPick={openTx} />
+      <div style={{ height: 110 }} />
+      <BottomNav active={activeTab} onChange={goTab} onFabClick={() => setFabOpen(true)} />
+      <FabSheet open={fabOpen} onPick={openTx} onClose={() => setFabOpen(false)} />
       {txModal && (
         <TransactionForm
           data={data}
