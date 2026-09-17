@@ -451,37 +451,205 @@ function buildInsights(d) {
 /* ============================================================
    PERSISTENT STORAGE HOOK
    ============================================================ */
-function usePersistentData() {
+function usePersistentData(userId) {
   const [data, setData] = useState(null);
   const [ready, setReady] = useState(false);
   const saveTimer = useRef(null);
+  const storageKey = userId ? `${STORAGE_KEY}-${userId}` : null;
 
   useEffect(() => {
-    let loaded = null;
-    try {
-      const raw = window.localStorage.getItem(STORAGE_KEY);
-      if (raw) loaded = JSON.parse(raw);
-    } catch (e) {
-      loaded = null;
+    if (!storageKey) {
+      setData(null);
+      setReady(false);
+      return;
     }
-    setData(loaded ? { ...createDefaultData(), ...loaded } : createDefaultData());
-    setReady(true);
-  }, []);
+    let mounted = true;
+    setReady(false);
+    setData(null);
+    (async () => {
+      let loaded = null;
+      try {
+        const raw = window.localStorage.getItem(storageKey);
+        if (raw) loaded = JSON.parse(raw);
+      } catch (e) {
+        loaded = null;
+      }
+      if (!mounted) return;
+      setData(loaded ? { ...createDefaultData(), ...loaded } : createDefaultData());
+      setReady(true);
+    })();
+    return () => {
+      mounted = false;
+    };
+  }, [storageKey]);
 
   useEffect(() => {
-    if (!ready || !data) return;
+    if (!ready || !data || !storageKey) return;
     if (saveTimer.current) clearTimeout(saveTimer.current);
     saveTimer.current = setTimeout(() => {
       try {
-        window.localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+        window.localStorage.setItem(storageKey, JSON.stringify(data));
       } catch (e) {
         /* storage full or blocked - ignore, data still safe in memory this session */
       }
     }, 300);
     return () => clearTimeout(saveTimer.current);
-  }, [data, ready]);
+  }, [data, ready, storageKey]);
 
   return [data, setData, ready];
+}
+
+/* ============================================================
+   AUTH — local accounts (register/login/logout), stored on-device.
+   No server: each browser/device keeps its own list of household
+   accounts, each with its own isolated data namespace. Passwords are
+   hashed (SHA-256 via the browser's own crypto) before being stored —
+   reasonable for casual protection, but this is not a substitute for
+   real server-side authentication.
+   ============================================================ */
+const USERS_KEY = "kk-users-v1";
+const SESSION_KEY = "kk-session-v1";
+const LEGACY_DATA_KEY = "kk-data-v1"; // fixed single-household key used before multi-account support
+
+async function hashPassword(password) {
+  try {
+    const enc = new TextEncoder().encode(password);
+    const buf = await window.crypto.subtle.digest("SHA-256", enc);
+    return Array.from(new Uint8Array(buf)).map((b) => b.toString(16).padStart(2, "0")).join("");
+  } catch (e) {
+    return null;
+  }
+}
+
+function useAuth() {
+  const [users, setUsers] = useState(null);
+  const [sessionUserId, setSessionUserId] = useState(null);
+  const [ready, setReady] = useState(false);
+  const [authError, setAuthError] = useState("");
+
+  useEffect(() => {
+    let loadedUsers = [];
+    try {
+      const raw = window.localStorage.getItem(USERS_KEY);
+      if (raw) loadedUsers = JSON.parse(raw);
+    } catch (e) {
+      loadedUsers = [];
+    }
+
+    let loadedSession = null;
+    try {
+      const raw2 = window.localStorage.getItem(SESSION_KEY);
+      if (raw2) loadedSession = JSON.parse(raw2);
+    } catch (e) {
+      loadedSession = null;
+    }
+
+    if (loadedUsers.length === 0) {
+      try {
+        const legacyRaw = window.localStorage.getItem(LEGACY_DATA_KEY);
+        if (legacyRaw) {
+          const legacyData = JSON.parse(legacyRaw);
+          if (legacyData && legacyData.settings && legacyData.settings.onboarded) {
+            const userId = uid("user");
+            const user = {
+              id: userId,
+              nama: legacyData.settings.familyName || "Keluarga",
+              email: legacyData.settings.email || null,
+              password_hash: null,
+              avatar: legacyData.settings.avatar || null,
+              authProvider: legacyData.settings.authProvider || "manual",
+              created_at: Date.now(),
+            };
+            loadedUsers = [user];
+            loadedSession = { userId };
+            window.localStorage.setItem(USERS_KEY, JSON.stringify(loadedUsers));
+            window.localStorage.setItem(SESSION_KEY, JSON.stringify(loadedSession));
+            window.localStorage.setItem(`${STORAGE_KEY}-${userId}`, JSON.stringify(legacyData));
+          }
+        }
+      } catch (e) {
+        /* no legacy data */
+      }
+    }
+
+    setUsers(loadedUsers);
+    setSessionUserId((loadedSession && loadedSession.userId) || null);
+    setReady(true);
+  }, []);
+
+  function persistUsers(next) {
+    setUsers(next);
+    try {
+      window.localStorage.setItem(USERS_KEY, JSON.stringify(next));
+    } catch (e) {
+      /* ignore */
+    }
+  }
+  function persistSession(userId) {
+    setSessionUserId(userId);
+    try {
+      if (userId) window.localStorage.setItem(SESSION_KEY, JSON.stringify({ userId }));
+      else window.localStorage.removeItem(SESSION_KEY);
+    } catch (e) {
+      /* ignore */
+    }
+  }
+
+  async function register(nama, email, password) {
+    setAuthError("");
+    const emailNorm = (email || "").trim().toLowerCase();
+    if (!nama.trim()) return setAuthError("Nama keluarga wajib diisi."), false;
+    if (!emailNorm || !emailNorm.includes("@")) return setAuthError("Email tidak valid."), false;
+    if (!password || password.length < 6) return setAuthError("Password minimal 6 karakter."), false;
+    if ((users || []).some((u) => u.email && u.email.toLowerCase() === emailNorm)) return setAuthError("Email sudah terdaftar. Coba masuk."), false;
+    const hash = await hashPassword(password);
+    const userId = uid("user");
+    const user = { id: userId, nama: nama.trim(), email: emailNorm, password_hash: hash, avatar: null, authProvider: "manual", created_at: Date.now() };
+    persistUsers([...(users || []), user]);
+    persistSession(userId);
+    return true;
+  }
+
+  async function login(email, password) {
+    setAuthError("");
+    const emailNorm = (email || "").trim().toLowerCase();
+    const user = (users || []).find((u) => u.email && u.email.toLowerCase() === emailNorm);
+    if (!user) return setAuthError("Email belum terdaftar."), false;
+    if (!user.password_hash) return setAuthError("Akun ini belum punya password (dibuat lewat Google). Masuk dengan Google, atau atur password lewat Pengaturan setelah masuk."), false;
+    const hash = await hashPassword(password);
+    if (!hash || hash !== user.password_hash) return setAuthError("Password salah."), false;
+    persistSession(user.id);
+    return true;
+  }
+
+  async function loginWithGoogle(profile) {
+    setAuthError("");
+    const emailNorm = (profile.email || "").trim().toLowerCase();
+    let user = emailNorm ? (users || []).find((u) => u.email && u.email.toLowerCase() === emailNorm) : null;
+    if (!user) {
+      const userId = uid("user");
+      user = { id: userId, nama: profile.name || "Keluarga", email: emailNorm || null, password_hash: null, avatar: profile.avatar || null, authProvider: "google", created_at: Date.now() };
+      persistUsers([...(users || []), user]);
+    }
+    persistSession(user.id);
+    return true;
+  }
+
+  async function logout() {
+    persistSession(null);
+  }
+
+  async function setPasswordForCurrentUser(userId, password) {
+    setAuthError("");
+    if (!password || password.length < 6) return setAuthError("Password minimal 6 karakter."), false;
+    const hash = await hashPassword(password);
+    persistUsers((users || []).map((u) => (u.id === userId ? { ...u, password_hash: hash } : u)));
+    return true;
+  }
+
+  const currentUser = (users || []).find((u) => u.id === sessionUserId) || null;
+
+  return { ready, users: users || [], currentUser, register, login, loginWithGoogle, logout, setPasswordForCurrentUser, authError, setAuthError };
 }
 
 /* ============================================================
@@ -770,11 +938,7 @@ function decodeJwt(token) {
   }
 }
 
-/* ============================================================
-   ONBOARDING
-   ============================================================ */
-function Onboarding({ onStart }) {
-  const [name, setName] = useState("");
+function GoogleAuthButton({ onCredential }) {
   const googleBtnRef = useRef(null);
 
   useEffect(() => {
@@ -787,11 +951,7 @@ function Onboarding({ onStart }) {
         callback: (resp) => {
           const payload = decodeJwt(resp.credential);
           if (payload) {
-            onStart(payload.name || payload.email || "Keluarga", {
-              email: payload.email || null,
-              avatar: payload.picture || null,
-              authProvider: "google",
-            });
+            onCredential({ name: payload.name || payload.email || "Keluarga", email: payload.email || null, avatar: payload.picture || null });
           }
         },
       });
@@ -812,42 +972,105 @@ function Onboarding({ onStart }) {
     };
   }, []);
 
+  if (!GOOGLE_CLIENT_ID) return null;
+  return (
+    <div className="mb-4">
+      <div ref={googleBtnRef} className="flex justify-center" />
+      <div className="my-4 flex items-center gap-3">
+        <div className="h-px flex-1" style={{ background: C.border }} />
+        <span className="text-[11px] font-semibold" style={{ color: C.muted }}>atau</span>
+        <div className="h-px flex-1" style={{ background: C.border }} />
+      </div>
+    </div>
+  );
+}
+
+function AuthHero({ title, subtitle }) {
+  return (
+    <div>
+      <div className="mb-6 inline-flex items-center gap-2 rounded-full px-3 py-1.5" style={{ background: "rgba(34,48,58,0.10)" }}>
+        <Sparkles size={14} color={C.mintDark} />
+        <span className="text-[12px] font-bold" style={{ color: C.ink }}>{title}</span>
+      </div>
+      <h1 className="text-[34px] font-extrabold leading-tight" style={{ color: C.ink, fontFamily: "'Baloo 2', sans-serif" }}>
+        Keuangan{"\n"}Keluarga
+      </h1>
+      <p className="mt-3 max-w-[280px] text-[15px]" style={{ color: "rgba(34,48,58,0.72)" }}>{subtitle}</p>
+      <div className="mt-8 flex gap-3">
+        <div className="flex h-16 w-16 items-center justify-center rounded-3xl text-2xl" style={{ background: C.mint }}>{"\u{1F4B0}"}</div>
+        <div className="mt-4 flex h-16 w-16 items-center justify-center rounded-3xl text-2xl" style={{ background: C.orange }}>{"\u{1F3E0}"}</div>
+        <div className="flex h-16 w-16 items-center justify-center rounded-3xl text-2xl" style={{ background: "white" }}>{"\u{1F3AF}"}</div>
+      </div>
+    </div>
+  );
+}
+
+/* ============================================================
+   LOGIN
+   ============================================================ */
+function LoginPage({ auth, onSwitch }) {
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  async function submit() {
+    if (!email.trim() || !password) return;
+    setBusy(true);
+    await auth.login(email, password);
+    setBusy(false);
+  }
+
   return (
     <div className="flex min-h-screen flex-col justify-between px-6 pb-8 pt-16" style={{ background: `linear-gradient(160deg, ${C.blue}, ${C.blueDark})` }}>
-      <div>
-        <div className="mb-6 inline-flex items-center gap-2 rounded-full px-3 py-1.5" style={{ background: "rgba(34,48,58,0.10)" }}>
-          <Sparkles size={14} color={C.mintDark} />
-          <span className="text-[12px] font-bold" style={{ color: C.ink }}>Selamat datang</span>
-        </div>
-        <h1 className="text-[34px] font-extrabold leading-tight" style={{ color: C.ink, fontFamily: "'Baloo 2', sans-serif" }}>
-          Keuangan{"\n"}Keluarga
-        </h1>
-        <p className="mt-3 max-w-[280px] text-[15px]" style={{ color: "rgba(34,48,58,0.72)" }}>
-          Catat uang masuk, uang keluar, tagihan, dan tabungan keluarga—semua dalam satu tempat yang sederhana.
-        </p>
-        <div className="mt-8 flex gap-3">
-          <div className="flex h-16 w-16 items-center justify-center rounded-3xl text-2xl" style={{ background: C.mint }}>{"\u{1F4B0}"}</div>
-          <div className="mt-4 flex h-16 w-16 items-center justify-center rounded-3xl text-2xl" style={{ background: C.orange }}>{"\u{1F3E0}"}</div>
-          <div className="flex h-16 w-16 items-center justify-center rounded-3xl text-2xl" style={{ background: "white" }}>{"\u{1F3AF}"}</div>
-        </div>
-      </div>
+      <AuthHero title="Selamat datang kembali" subtitle="Masuk untuk melanjutkan catatan keuangan keluargamu." />
       <div className="rounded-[28px] bg-white p-5">
-        {GOOGLE_CLIENT_ID && (
-          <div className="mb-4">
-            <div ref={googleBtnRef} className="flex justify-center" />
-            <div className="my-4 flex items-center gap-3">
-              <div className="h-px flex-1" style={{ background: C.border }} />
-              <span className="text-[11px] font-semibold" style={{ color: C.muted }}>atau isi manual</span>
-              <div className="h-px flex-1" style={{ background: C.border }} />
-            </div>
-          </div>
-        )}
-        <div className="mb-3 text-[15px] font-extrabold" style={{ color: C.ink, fontFamily: "'Baloo 2', sans-serif" }}>Siapa nama keluargamu?</div>
-        <TextInput placeholder="Contoh: Keluarga Santoso" value={name} onChange={(e) => setName(e.target.value)} />
-        <div className="mt-4">
-          <PrimaryButton disabled={!name.trim()} onClick={() => onStart(name.trim())}>Mulai Sekarang</PrimaryButton>
-        </div>
-        <p className="mt-3 text-center text-[12px]" style={{ color: C.muted }}>Data kamu tersimpan otomatis untuk akunmu.</p>
+        <GoogleAuthButton onCredential={(profile) => auth.loginWithGoogle(profile)} />
+        <Field label="Email"><TextInput type="email" autoCapitalize="none" placeholder="nama@email.com" value={email} onChange={(e) => setEmail(e.target.value)} /></Field>
+        <Field label="Password"><TextInput type="password" placeholder="Masukkan password" value={password} onChange={(e) => setPassword(e.target.value)} /></Field>
+        {auth.authError && <div className="mb-3 rounded-xl px-3 py-2.5 text-[13px] font-semibold" style={{ background: C.redLight, color: C.red }}>{auth.authError}</div>}
+        <PrimaryButton disabled={busy || !email.trim() || !password} onClick={submit}>{busy ? "Memeriksa..." : "Masuk"}</PrimaryButton>
+        <button onClick={() => { auth.setAuthError(""); onSwitch(); }} className="mt-4 w-full text-center text-[13px] font-semibold" style={{ color: C.blueDark }}>
+          Belum punya akun? <span style={{ textDecoration: "underline" }}>Daftar</span>
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/* ============================================================
+   REGISTER
+   ============================================================ */
+function RegisterPage({ auth, onSwitch }) {
+  const [nama, setNama] = useState("");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [confirm, setConfirm] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [localErr, setLocalErr] = useState("");
+
+  async function submit() {
+    setLocalErr("");
+    if (password !== confirm) return setLocalErr("Konfirmasi password tidak cocok.");
+    setBusy(true);
+    await auth.register(nama, email, password);
+    setBusy(false);
+  }
+
+  return (
+    <div className="flex min-h-screen flex-col justify-between px-6 pb-8 pt-16" style={{ background: `linear-gradient(160deg, ${C.blue}, ${C.blueDark})` }}>
+      <AuthHero title="Selamat datang" subtitle="Buat akun keluarga untuk mulai mencatat uang masuk, uang keluar, tagihan, dan tabungan." />
+      <div className="rounded-[28px] bg-white p-5">
+        <GoogleAuthButton onCredential={(profile) => auth.loginWithGoogle(profile)} />
+        <Field label="Nama keluarga"><TextInput placeholder="Contoh: Keluarga Santoso" value={nama} onChange={(e) => setNama(e.target.value)} /></Field>
+        <Field label="Email"><TextInput type="email" autoCapitalize="none" placeholder="nama@email.com" value={email} onChange={(e) => setEmail(e.target.value)} /></Field>
+        <Field label="Password"><TextInput type="password" placeholder="Minimal 6 karakter" value={password} onChange={(e) => setPassword(e.target.value)} /></Field>
+        <Field label="Ulangi password"><TextInput type="password" placeholder="Ketik ulang password" value={confirm} onChange={(e) => setConfirm(e.target.value)} /></Field>
+        {(localErr || auth.authError) && <div className="mb-3 rounded-xl px-3 py-2.5 text-[13px] font-semibold" style={{ background: C.redLight, color: C.red }}>{localErr || auth.authError}</div>}
+        <PrimaryButton disabled={busy || !nama.trim() || !email.trim() || !password} onClick={submit}>{busy ? "Memproses..." : "Daftar"}</PrimaryButton>
+        <button onClick={() => { auth.setAuthError(""); onSwitch(); }} className="mt-4 w-full text-center text-[13px] font-semibold" style={{ color: C.blueDark }}>
+          Sudah punya akun? <span style={{ textDecoration: "underline" }}>Masuk</span>
+        </button>
+        <p className="mt-3 text-center text-[11.5px] leading-relaxed" style={{ color: C.muted }}>Akun & data tersimpan di perangkat ini saja (belum sinkron ke perangkat lain).</p>
       </div>
     </div>
   );
@@ -2747,28 +2970,48 @@ function MorePage({ go, data }) {
   );
 }
 
-function SettingsPage({ data, mutate, back }) {
+function SettingsPage({ data, mutate, back, auth }) {
   const [name, setName] = useState(data.settings.familyName || "");
   const [confirmReset, setConfirmReset] = useState(false);
   const [confirmSignOut, setConfirmSignOut] = useState(false);
   const [saved, setSaved] = useState(false);
-  const isGoogle = data.settings.authProvider === "google";
+  const [newPass, setNewPass] = useState("");
+  const [newPassConfirm, setNewPassConfirm] = useState("");
+  const [passSaved, setPassSaved] = useState(false);
+  const [passErr, setPassErr] = useState("");
+  const user = auth.currentUser;
+  const isGoogle = user?.authProvider === "google";
+
+  async function savePassword() {
+    setPassErr("");
+    if (newPass !== newPassConfirm) return setPassErr("Konfirmasi password tidak cocok.");
+    const ok = await auth.setPasswordForCurrentUser(user.id, newPass);
+    if (ok) {
+      setNewPass("");
+      setNewPassConfirm("");
+      setPassSaved(true);
+      setTimeout(() => setPassSaved(false), 1500);
+    } else {
+      setPassErr(auth.authError);
+    }
+  }
+
   return (
     <div className="pb-6">
       <PageHeader title="Pengaturan" onBack={back} />
       <div className="px-5">
-        {isGoogle && (
+        {user && (
           <div className="mb-5 flex items-center gap-3 rounded-3xl p-4" style={{ background: C.card, border: `1px solid ${C.border}` }}>
-            {data.settings.avatar ? (
-              <img src={data.settings.avatar} alt="" className="h-12 w-12 rounded-full" />
+            {user.avatar ? (
+              <img src={user.avatar} alt="" className="h-12 w-12 rounded-full" />
             ) : (
               <IconChip emoji={"\u{1F464}"} color={C.blue} size={48} />
             )}
             <div className="min-w-0 flex-1">
-              <div className="truncate text-[14px] font-bold" style={{ color: C.ink }}>{data.settings.familyName}</div>
-              <div className="truncate text-[12px]" style={{ color: C.muted }}>{data.settings.email}</div>
+              <div className="truncate text-[14px] font-bold" style={{ color: C.ink }}>{user.nama}</div>
+              <div className="truncate text-[12px]" style={{ color: C.muted }}>{user.email || "Tanpa email"}</div>
             </div>
-            <span className="shrink-0 rounded-full px-2.5 py-1 text-[10.5px] font-bold" style={{ background: C.mintLight, color: C.mintDark }}>Google</span>
+            {isGoogle && <span className="shrink-0 rounded-full px-2.5 py-1 text-[10.5px] font-bold" style={{ background: C.mintLight, color: C.mintDark }}>Google</span>}
           </div>
         )}
         <Field label="Nama keluarga">
@@ -2780,17 +3023,26 @@ function SettingsPage({ data, mutate, back }) {
         <Field label="Mata uang"><TextInput value="IDR (Rupiah)" disabled /></Field>
         <Field label="Zona waktu"><TextInput value="Asia/Jakarta" disabled /></Field>
 
-        <div className="mt-6 rounded-3xl p-4" style={{ background: C.blueLight }}>
-          <div className="mb-1 flex items-center gap-2"><Info size={16} color={C.blueDark} /><span className="text-[13.5px] font-bold" style={{ color: C.ink }}>Tentang data kamu</span></div>
-          <p className="text-[12.5px] leading-relaxed" style={{ color: C.muted }}>Data keuangan disimpan otomatis untuk akun Claude kamu di percakapan ini. Ini adalah prototipe yang berjalan di sisi klien untuk keperluan uji coba, bukan pengganti server produksi dengan database nyata.</p>
+        <SectionTitle>{user?.password_hash ? "Ganti password" : "Atur password"}</SectionTitle>
+        {!user?.password_hash && (
+          <p className="mb-3 text-[12px]" style={{ color: C.muted }}>Akun ini belum punya password (dibuat lewat Google). Atur password supaya bisa masuk pakai email juga.</p>
+        )}
+        <Field label="Password baru"><TextInput type="password" placeholder="Minimal 6 karakter" value={newPass} onChange={(e) => setNewPass(e.target.value)} /></Field>
+        <Field label="Ulangi password baru"><TextInput type="password" placeholder="Ketik ulang" value={newPassConfirm} onChange={(e) => setNewPassConfirm(e.target.value)} /></Field>
+        {passErr && <div className="mb-3 rounded-xl px-3 py-2.5 text-[13px] font-semibold" style={{ background: C.redLight, color: C.red }}>{passErr}</div>}
+        <div className="mb-6">
+          <GhostButton color={C.blueDark} onClick={savePassword}>Simpan password</GhostButton>
         </div>
 
-        {isGoogle && (
-          <button onClick={() => setConfirmSignOut(true)} className="mt-6 w-full rounded-2xl py-3.5 text-[14px] font-bold" style={{ background: "#F1F2F8", color: C.ink }}>Keluar dari akun Google</button>
-        )}
+        <div className="mt-2 rounded-3xl p-4" style={{ background: C.blueLight }}>
+          <div className="mb-1 flex items-center gap-2"><Info size={16} color={C.blueDark} /><span className="text-[13.5px] font-bold" style={{ color: C.ink }}>Tentang data kamu</span></div>
+          <p className="text-[12.5px] leading-relaxed" style={{ color: C.muted }}>Data keuangan tersimpan otomatis untuk akunmu di perangkat ini. Ini adalah prototipe yang berjalan di sisi klien untuk keperluan uji coba, bukan pengganti server produksi dengan database nyata — akun & data belum tersinkron ke perangkat lain.</p>
+        </div>
+
+        <button onClick={() => setConfirmSignOut(true)} className="mt-6 w-full rounded-2xl py-3.5 text-[14px] font-bold" style={{ background: "#F1F2F8", color: C.ink }}>Keluar</button>
         <button onClick={() => setConfirmReset(true)} className="mt-3 w-full rounded-2xl py-3.5 text-[14px] font-bold" style={{ background: C.redLight, color: C.red }}>Hapus semua data</button>
       </div>
-      <Toast message={saved ? "Perubahan disimpan" : ""} />
+      <Toast message={saved ? "Perubahan disimpan" : passSaved ? "Password disimpan" : ""} />
       {confirmReset && (
         <ConfirmDialog
           title="Hapus semua data?"
@@ -2802,8 +3054,8 @@ function SettingsPage({ data, mutate, back }) {
       )}
       {confirmSignOut && (
         <ConfirmDialog
-          title="Keluar dari akun Google?"
-          message="Kamu akan kembali ke halaman awal. Data keuangan yang sudah tersimpan di perangkat ini tidak akan hilang."
+          title="Keluar dari akun ini?"
+          message="Kamu akan kembali ke halaman masuk. Data keuangan yang sudah tersimpan di perangkat ini tidak akan hilang, dan bisa diakses lagi setelah masuk ulang."
           onCancel={() => setConfirmSignOut(false)}
           onConfirm={() => {
             try {
@@ -2811,7 +3063,7 @@ function SettingsPage({ data, mutate, back }) {
             } catch (e) {
               /* ignore */
             }
-            mutate.setBulk({ settings: { ...data.settings, onboarded: false, email: null, avatar: null, authProvider: "manual" } });
+            auth.logout();
             setConfirmSignOut(false);
           }}
         />
@@ -2895,10 +3147,27 @@ function Shell({ children }) {
    MAIN APP
    ============================================================ */
 export default function App() {
-  const [data, setData, ready] = usePersistentData();
+  const auth = useAuth();
+  const [data, setData, ready] = usePersistentData(auth.currentUser?.id || null);
+  const [authView, setAuthView] = useState("login");
+
+  // Always land back on the Login screen (not stuck on Register) after signing out.
+  useEffect(() => {
+    if (!auth.currentUser) setAuthView("login");
+  }, [auth.currentUser]);
+
   const [stack, setStack] = useState([{ page: "dashboard" }]);
   const [txModal, setTxModal] = useState(null);
   const [fabOpen, setFabOpen] = useState(false);
+
+  // Start fresh at the dashboard (and close any open modal) whenever the logged-in
+  // account changes — logging out, logging back in, or switching to a different account —
+  // so no one resumes on a stale page or mid-open form left over from a previous session.
+  useEffect(() => {
+    setStack([{ page: "dashboard" }]);
+    setTxModal(null);
+    setFabOpen(false);
+  }, [auth.currentUser?.id]);
 
   const current = stack[stack.length - 1];
 
@@ -2916,6 +3185,51 @@ export default function App() {
       }
     : null;
 
+  // Brand-new account: seed its data with the profile info collected at register/Google login.
+  // Runs once (guarded by the onboarded flag itself), right after fresh data loads for this user.
+  useEffect(() => {
+    if (!ready || !data || data.settings.onboarded || !auth.currentUser) return;
+    setData((d) => ({
+      ...d,
+      settings: {
+        ...d.settings,
+        familyName: auth.currentUser.nama,
+        onboarded: true,
+        email: auth.currentUser.email || null,
+        avatar: auth.currentUser.avatar || null,
+        authProvider: auth.currentUser.authProvider || "manual",
+      },
+    }));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ready, data && data.settings.onboarded, auth.currentUser]);
+
+  if (!auth.ready) {
+    return (
+      <Shell>
+        <div className="flex min-h-screen w-full items-center justify-center">
+          <div className="flex flex-col items-center gap-3">
+            <div className="flex h-14 w-14 items-center justify-center rounded-3xl" style={{ background: C.blue }}>
+              <Wallet size={26} color={contrastText(C.blue)} />
+            </div>
+            <div className="text-[13px] font-semibold" style={{ color: C.muted }}>Memuat...</div>
+          </div>
+        </div>
+      </Shell>
+    );
+  }
+
+  if (!auth.currentUser) {
+    return (
+      <Shell>
+        {authView === "login" ? (
+          <LoginPage auth={auth} onSwitch={() => setAuthView("register")} />
+        ) : (
+          <RegisterPage auth={auth} onSwitch={() => setAuthView("login")} />
+        )}
+      </Shell>
+    );
+  }
+
   if (!ready || !data) {
     return (
       <Shell>
@@ -2931,23 +3245,13 @@ export default function App() {
     );
   }
 
+  // Brand-new account: seed its data with the profile info collected at register/Google login.
   if (!data.settings.onboarded) {
     return (
       <Shell>
-        <Onboarding
-          onStart={(name, profile) =>
-            mutate.setBulk({
-              settings: {
-                ...data.settings,
-                familyName: name,
-                onboarded: true,
-                email: profile?.email || null,
-                avatar: profile?.avatar || null,
-                authProvider: profile?.authProvider || "manual",
-              },
-            })
-          }
-        />
+        <div className="flex min-h-screen w-full items-center justify-center">
+          <div className="text-[13px] font-semibold" style={{ color: C.muted }}>Menyiapkan akunmu...</div>
+        </div>
       </Shell>
     );
   }
@@ -3020,7 +3324,7 @@ export default function App() {
       body = <ReportsPage data={data} />;
       break;
     case "settings":
-      body = <SettingsPage data={data} mutate={mutate} back={back} />;
+      body = <SettingsPage data={data} mutate={mutate} back={back} auth={auth} />;
       break;
     default:
       body = <Dashboard data={data} go={go} openTx={openTx} />;

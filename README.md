@@ -57,10 +57,20 @@ Data disimpan di **localStorage** browser HP kamu (bukan server), jadi:
 - Data **tidak otomatis sinkron** antar HP/browser lain — ini murni penyimpanan lokal per perangkat.
 - Menghapus cache/data browser, atau "Clear storage", akan menghapus data juga. Cadangkan secara berkala kalau perlu (fitur export bisa ditambahkan kalau kamu mau).
 
+## Login, Daftar & Keluar
+Aplikasi ini sekarang punya halaman Masuk/Daftar sendiri:
+- **Daftar**: buat akun dengan nama keluarga, email, dan password (minimal 6 karakter).
+- **Masuk**: pakai email & password yang sama untuk lanjut ke data yang sama.
+- **Keluar**: ada di halaman Pengaturan, kembali ke halaman Masuk (data tidak hilang).
+- Bisa lebih dari satu akun/keluarga di HP yang sama — tiap akun datanya terpisah total, tidak akan tercampur.
+- Kalau kamu sebelumnya sudah pakai versi lama (tanpa login), datanya **otomatis dipindahkan** jadi akun pertamamu saat pertama kali buka versi baru ini — tidak perlu daftar ulang, tidak ada data yang hilang.
+
+Catatan jujur soal keamanan: karena ini aplikasi tanpa server, password disimpan dalam bentuk **ter-hash** (bukan teks biasa) di HP itu sendiri — cukup untuk mencegah orang lain iseng buka-buka lewat aplikasi, tapi bukan pengganti keamanan server sungguhan. Akun juga hanya ada di HP itu saja (belum bisa dipakai login dari HP lain).
+
 ## Kalau ingin upgrade ke backend sungguhan
-Versi ini cocok untuk MVP satu keluarga di satu HP. Kalau nanti butuh multi-device
-sync, login banyak pengguna, dan database nyata (PostgreSQL + Prisma sesuai
-dokumen awal), itu perlu server backend sungguhan — beri tahu saya, saya bisa
+Versi ini cocok untuk MVP keluarga di satu HP. Kalau nanti butuh multi-device
+sync (akun bisa dipakai login dari HP manapun), database nyata (PostgreSQL + Prisma
+sesuai dokumen awal), itu perlu server backend sungguhan — beri tahu saya, saya bisa
 siapkan source code Next.js + Prisma-nya secara terpisah untuk dijalankan di
 komputer/server dengan `npm install` dan database asli.
 
